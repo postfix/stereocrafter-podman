@@ -337,14 +337,50 @@ cmd_convert() {
 
   auto_configure
 
-  # Probe up front so we can print pre-flight estimate.
+  # Probe up front. Parse named ffprobe output (key=value per line).
   local probe; probe=$(probe_video "$in_abs")
-  local total_frames width height
-  IFS=, read -r total_frames width height <<< "$probe"
-  if ! [[ "$total_frames" =~ ^[0-9]+$ ]] || [ "$total_frames" -le 0 ]; then
-    die "ffprobe could not determine frame count for $in_abs"
+  local total_frames="" width="" height=""
+  while IFS='=' read -r key value; do
+    case "$key" in
+      width)          width="$value" ;;
+      height)         height="$value" ;;
+      nb_read_frames) total_frames="$value" ;;
+    esac
+  done <<< "$probe"
+  if ! [[ "${total_frames:-}" =~ ^[0-9]+$ ]] || [ "$total_frames" -le 0 ]; then
+    die "ffprobe could not determine frame count for $in_abs (probe output: $probe)"
+  fi
+  if ! [[ "${width:-}" =~ ^[0-9]+$ ]] || ! [[ "${height:-}" =~ ^[0-9]+$ ]]; then
+    die "ffprobe could not determine dimensions for $in_abs"
   fi
   log "input: $total_frames frames @ ${width}×${height}"
+
+  # StereoCrafter's UNet stride math needs (2W, 2H) divisible by 64 to avoid
+  # skip-connection shape mismatches in inpaint. Pad to nearest multiples of 32
+  # if dims aren't already safe. Padded video sits in $out_abs/.preproc_<base>/.
+  if [ $(( width % 32 )) -ne 0 ] || [ $(( height % 32 )) -ne 0 ]; then
+    local sw=$(( (width  + 31) / 32 * 32 ))
+    local sh=$(( (height + 31) / 32 * 32 ))
+    log "padding ${width}×${height} → ${sw}×${sh} (UNet stride constraint)"
+    local preproc_dir="$out_abs/.preproc_$base"
+    mkdir -p "$preproc_dir"
+    local padded="$preproc_dir/$base.mp4"
+    local in_dir; in_dir="$(dirname "$in_abs")"
+    local in_name; in_name="$(basename "$in_abs")"
+    podman run --rm \
+      -v "$in_dir:/in:ro" \
+      -v "$preproc_dir:/out" \
+      "$IMAGE" \
+      ffmpeg -hide_banner -loglevel error -y \
+        -i "/in/$in_name" \
+        -vf "pad=${sw}:${sh}:(${sw}-iw)/2:(${sh}-ih)/2:color=black,setsar=1" \
+        -c:v libx264 -preset veryfast -crf 17 -pix_fmt yuv420p \
+        -an \
+        "/out/$base.mp4"
+    in_abs="$padded"
+    width="$sw"; height="$sh"
+    log "preprocessed input: $in_abs"
+  fi
 
   # Decide single vs multi-GPU.
   local n_gpus=1
@@ -369,6 +405,10 @@ cmd_convert() {
 
   local elapsed=$(( $(date +%s) - convert_start ))
   log "done in $(format_duration "$elapsed"). outputs in: $out_abs"
+
+  if [ "$KEEP_CHUNKS" != "1" ] && [ -d "$out_abs/.preproc_$base" ]; then
+    rm -rf "$out_abs/.preproc_$base"
+  fi
 }
 
 # Probe total frame count of a video (runs ffprobe in a quick container).
@@ -385,7 +425,9 @@ probe_frames() {
     | tr -d '\r\n'
 }
 
-# Probe frame count + WxH in one pass. Echoes "<frames>,<w>,<h>".
+# Probe frame count + WxH from the FIRST video stream only.
+# Named output (default=nw=1) avoids field-order surprises and multi-stream collisions
+# (mp4s often carry a thumbnail/cover-art video stream alongside the real video).
 probe_video() {
   local in_abs="$1"
   local in_dir; in_dir="$(dirname "$in_abs")"
@@ -393,9 +435,9 @@ probe_video() {
   podman run --rm -i \
     -v "$in_dir:/in:ro" \
     "$IMAGE" \
-    ffprobe -v error -select_streams v -count_frames \
-      -show_entries stream=nb_read_frames,width,height -of csv=p=0 "/in/$in_name" \
-    | tr -d '\r\n'
+    ffprobe -v error -select_streams v:0 -count_frames \
+      -show_entries stream=width,height,nb_read_frames \
+      -of default=nw=1 "/in/$in_name"
 }
 
 # Pretty-print a duration in seconds as "Xd Yh", "Xh Ym", "Xm Ys", or "Xs".
