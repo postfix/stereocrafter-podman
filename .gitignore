@@ -1,0 +1,26 @@
+# Model weights — pulled via `./stereocrafter pull-weights` (~24 GB)
+weights/
+
+# User videos
+input/
+output/
+out/
+
+# Build artefacts
+*.log
+__pycache__/
+*.pyc
+
+# Editor / OS / tooling junk
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+.claude/
+
+# Anything sensitive that might land here by accident
+*.token
+*.pem
+.env
+.env.*

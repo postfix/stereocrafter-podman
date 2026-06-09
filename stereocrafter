@@ -1,0 +1,738 @@
+#!/usr/bin/env bash
+# stereocrafter — podman wrapper for TencentARC/StereoCrafter
+#
+# Subcommands:
+#   build                       Build the podman image (one-time, ~30 min)
+#   pull-weights                Download model weights (~20 GB, one-time)
+#   convert  <video> [out_dir]  Full 2D→stereo pipeline (depth+splat → inpaint)
+#   splat    <video> [out.mp4]  Stage 1 only: depth + forward splatting
+#   inpaint  <splat.mp4> [out_dir]  Stage 2 only: stereo inpainting
+#   shell                       Drop into an interactive shell in the container
+#   status                      Show image + weights state
+#
+# Layout (override with env vars):
+#   STEREOCRAFTER_ROOT     project root (default: dir of this script)
+#   STEREOCRAFTER_WEIGHTS  weights dir  (default: $ROOT/weights)
+#   STEREOCRAFTER_OUTPUT   default output dir (default: $ROOT/output)
+#   STEREOCRAFTER_IMAGE    image tag (default: localhost/stereocrafter:latest)
+#   STEREOCRAFTER_TILE_NUM tile_num for inpainting (default: 2)
+#   STEREOCRAFTER_GPU      pin to one GPU (e.g. 0 or 1). When unset, `convert` auto-
+#                          splits the input across all visible GPUs (parallel pipelines,
+#                          one per card) and concatenates the results.
+#                          Set to a single index to force single-GPU mode.
+#   STEREOCRAFTER_CHUNK_FRAMES   chunk size for long videos (default: 256).
+#                          DepthCrafter loads the entire video tensor into VRAM at once;
+#                          inputs longer than this are split with ffmpeg, processed per
+#                          chunk, then concatenated. Set to 0 to disable chunking.
+#   STEREOCRAFTER_KEEP_CHUNKS    set to 1 to keep intermediate per-chunk files
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${STEREOCRAFTER_ROOT:-$SCRIPT_DIR}"
+IMAGE="${STEREOCRAFTER_IMAGE:-localhost/stereocrafter:latest}"
+WEIGHTS="${STEREOCRAFTER_WEIGHTS:-$ROOT/weights}"
+OUTPUT="${STEREOCRAFTER_OUTPUT:-$ROOT/output}"
+# CHUNK_FRAMES / TILE_NUM are auto-tuned from free VRAM when not explicitly set.
+# Detect "explicitly set" by checking presence in env (handles `=` to empty too).
+if [ "${STEREOCRAFTER_CHUNK_FRAMES+set}" = "set" ]; then
+  CHUNK_FRAMES="$STEREOCRAFTER_CHUNK_FRAMES"; CHUNK_FRAMES_AUTO=0
+else
+  CHUNK_FRAMES=256; CHUNK_FRAMES_AUTO=1
+fi
+if [ "${STEREOCRAFTER_TILE_NUM+set}" = "set" ]; then
+  TILE_NUM="$STEREOCRAFTER_TILE_NUM"; TILE_NUM_AUTO=0
+else
+  TILE_NUM=2; TILE_NUM_AUTO=1
+fi
+KEEP_CHUNKS="${STEREOCRAFTER_KEEP_CHUNKS:-0}"
+
+# Each HF weights repo and its destination dir
+HF_REPOS=(
+  "stabilityai/stable-video-diffusion-img2vid-xt-1-1:stable-video-diffusion-img2vid-xt-1-1"
+  "tencent/DepthCrafter:DepthCrafter"
+  "TencentARC/StereoCrafter:StereoCrafter"
+)
+
+die() { echo "error: $*" >&2; exit 1; }
+log() { echo ">> $*" >&2; }
+
+usage() {
+  sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+image_exists() {
+  podman image exists "$IMAGE"
+}
+
+weights_ready() {
+  for entry in "${HF_REPOS[@]}"; do
+    local dir="${entry##*:}"
+    [ -d "$WEIGHTS/$dir" ] && [ -n "$(ls -A "$WEIGHTS/$dir" 2>/dev/null)" ] || return 1
+  done
+  return 0
+}
+
+ensure_image() {
+  image_exists || die "image $IMAGE not built — run: $0 build"
+}
+
+# Choose -it only when stdout is a tty (so logs pipe cleanly)
+tty_flags() {
+  if [ -t 0 ] && [ -t 1 ]; then echo "-it"; else echo "-i"; fi
+}
+
+# Run podman with weights + arbitrary extra binds.
+# Args: <extra-flags...> -- <image-cmd...>
+prun() {
+  local extra=()
+  while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
+    extra+=("$1"); shift
+  done
+  [ "${1:-}" = "--" ] && shift
+
+  mkdir -p "$WEIGHTS" "$WEIGHTS/.cache/huggingface"
+  # Pick up an HF token from env or the standard host location, for gated repos (e.g. SVD).
+  # Pass via --env-file (mode 0600) so the token doesn't appear in `ps` output.
+  local hf_env=()
+  local tok=""
+  if [ -n "${HF_TOKEN:-}" ]; then
+    tok="$HF_TOKEN"
+  elif [ -f "$HOME/.cache/huggingface/token" ]; then
+    tok="$(cat "$HOME/.cache/huggingface/token")"
+  fi
+  local env_file=""
+  if [ -n "$tok" ]; then
+    env_file="$(mktemp -t stereocrafter-env.XXXXXX)"
+    chmod 600 "$env_file"
+    # shellcheck disable=SC2064
+    trap "rm -f '$env_file'" EXIT
+    {
+      printf 'HF_TOKEN=%s\n' "$tok"
+      printf 'HUGGING_FACE_HUB_TOKEN=%s\n' "$tok"
+    } > "$env_file"
+    hf_env+=(--env-file "$env_file")
+  fi
+  # Default rootless mapping (container root -> host user) is what we want for bind-mount ownership.
+  # Override HF_HOME into the weights mount so the cache persists and is writeable.
+  # GPU selection: STEREOCRAFTER_GPU=0 or =1 pins to one GPU; default exposes all.
+  # StereoCrafter's scripts only use cuda:0, so to use both 3090s run two jobs in parallel
+  # with STEREOCRAFTER_GPU=0 and STEREOCRAFTER_GPU=1 respectively.
+  local gpu_flag="nvidia.com/gpu=all"
+  if [ -n "${STEREOCRAFTER_GPU:-}" ]; then
+    gpu_flag="nvidia.com/gpu=$STEREOCRAFTER_GPU"
+  fi
+  # shellcheck disable=SC2046
+  podman run --rm $(tty_flags) \
+    --device "$gpu_flag" \
+    -e HF_HOME=/workspace/weights/.cache/huggingface \
+    -e HF_HUB_ENABLE_HF_TRANSFER=1 \
+    "${hf_env[@]}" \
+    -v "$WEIGHTS:/workspace/weights" \
+    -w /opt/StereoCrafter \
+    "${extra[@]}" \
+    "$IMAGE" "$@"
+}
+
+cmd_build() {
+  [ -f "$ROOT/Dockerfile" ] || die "no Dockerfile at $ROOT/Dockerfile"
+  log "building $IMAGE from $ROOT (this can take 20–40 minutes)"
+  podman build -t "$IMAGE" "$ROOT"
+}
+
+cmd_pull_weights() {
+  ensure_image
+  mkdir -p "$WEIGHTS"
+  log "downloading weights into $WEIGHTS (~20 GB, one-time)"
+  for entry in "${HF_REPOS[@]}"; do
+    local repo="${entry%%:*}" dir="${entry##*:}"
+    if [ -d "$WEIGHTS/$dir/.git" ] || [ -f "$WEIGHTS/$dir/config.json" ] || [ -f "$WEIGHTS/$dir/model_index.json" ]; then
+      log "skipping $repo (already present at $dir)"
+      continue
+    fi
+    log "fetching $repo -> $dir"
+    prun -- bash -c "
+      set -e
+      cd /workspace/weights
+      huggingface-cli download '$repo' --local-dir '$dir'
+    " || die "download of $repo failed.
+If this is the gated SVD repo, accept the license at:
+  https://huggingface.co/$repo
+then ensure your token is in ~/.cache/huggingface/token or export HF_TOKEN=..."
+  done
+  log "weights ready"
+}
+
+ensure_weights() {
+  if ! weights_ready; then
+    log "weights missing — running pull-weights"
+    cmd_pull_weights
+  fi
+}
+
+# Bind-mount the dir holding $1 read-only into /work_in, echo "/work_in/<basename>".
+bind_input() {
+  local p
+  p="$(realpath "$1")"
+  [ -f "$p" ] || die "input not found: $1"
+  printf '%s\0%s\0%s' "$(dirname "$p")" "/work_in" "$(basename "$p")"
+}
+
+# Bind-mount $1 (created if missing) read-write into /work_out, echo "/work_out".
+bind_output() {
+  local p="$1"
+  mkdir -p "$p"
+  p="$(realpath "$p")"
+  printf '%s\0%s' "$p" "/work_out"
+}
+
+cmd_splat() {
+  [ "$#" -ge 1 ] || die "usage: $0 splat <input.mp4> [output.mp4]"
+  ensure_image; ensure_weights
+  local in_video="$1"
+  local out_video="${2:-$OUTPUT/$(basename "${in_video%.*}")_splat.mp4}"
+
+  local in_abs; in_abs="$(realpath "$in_video")"; [ -f "$in_abs" ] || die "no such file: $in_video"
+  local in_dir; in_dir="$(dirname "$in_abs")"
+  local in_name; in_name="$(basename "$in_abs")"
+
+  mkdir -p "$(dirname "$out_video")"
+  local out_abs; out_abs="$(realpath "$out_video")"
+  local out_dir; out_dir="$(dirname "$out_abs")"
+  local out_name; out_name="$(basename "$out_abs")"
+
+  log "stage 1 (depth + splat): $in_name -> $out_name"
+  prun \
+    -v "$in_dir:/work_in:ro" \
+    -v "$out_dir:/work_out" \
+    -- python depth_splatting_inference.py \
+        --pre_trained_path /workspace/weights/stable-video-diffusion-img2vid-xt-1-1 \
+        --unet_path /workspace/weights/DepthCrafter \
+        --input_video_path "/work_in/$in_name" \
+        --output_video_path "/work_out/$out_name"
+  log "splat written: $out_abs"
+}
+
+cmd_inpaint() {
+  [ "$#" -ge 1 ] || die "usage: $0 inpaint <splat.mp4> [output_dir]"
+  ensure_image; ensure_weights
+  local in_video="$1"
+  local out_dir="${2:-$OUTPUT}"
+
+  local in_abs; in_abs="$(realpath "$in_video")"; [ -f "$in_abs" ] || die "no such file: $in_video"
+  local in_dir; in_dir="$(dirname "$in_abs")"
+  local in_name; in_name="$(basename "$in_abs")"
+
+  mkdir -p "$out_dir"
+  local out_abs; out_abs="$(realpath "$out_dir")"
+
+  log "stage 2 (inpaint, tile_num=$TILE_NUM): $in_name"
+  prun \
+    -v "$in_dir:/work_in:ro" \
+    -v "$out_abs:/work_out" \
+    -- python inpainting_inference.py \
+        --pre_trained_path /workspace/weights/stable-video-diffusion-img2vid-xt-1-1 \
+        --unet_path /workspace/weights/StereoCrafter \
+        --input_video_path "/work_in/$in_name" \
+        --save_dir /work_out \
+        --tile_num "$TILE_NUM"
+  log "inpaint outputs in: $out_abs"
+}
+
+detect_gpu_count() {
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || echo 0
+  elif command -v nvidia-ctk >/dev/null 2>&1; then
+    nvidia-ctk cdi list 2>/dev/null | grep -cE '^nvidia\.com/gpu=[0-9]+$' || echo 0
+  else
+    echo 1
+  fi
+}
+
+# Echo min free-VRAM (MB) across the GPUs we'll use, or 0 if nvidia-smi missing.
+detect_min_free_vram_mb() {
+  command -v nvidia-smi >/dev/null 2>&1 || { echo 0; return; }
+  local indices
+  if [ -n "${STEREOCRAFTER_GPU:-}" ]; then
+    indices="$STEREOCRAFTER_GPU"
+  else
+    indices=$(nvidia-smi --query-gpu=index --format=csv,noheader,nounits 2>/dev/null | tr '\n' ' ')
+  fi
+  local min=999999 free
+  for idx in $indices; do
+    free=$(nvidia-smi -i "$idx" --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
+    if [ -n "$free" ] && [ "$free" -lt "$min" ]; then min="$free"; fi
+  done
+  [ "$min" = "999999" ] && echo 0 || echo "$min"
+}
+
+# Pick chunk_frames + tile_num from free VRAM. Empirical linear model
+# calibrated for 1080p inputs (StereoCrafter downscales to max_res=1024 internally).
+#
+# Stage 1 (DepthCrafter) is the binding constraint and OOMs at video.to(device):
+#   peak ≈ MODEL_OVERHEAD + chunk_frames * PER_FRAME_MB
+#   MODEL_OVERHEAD ≈ 12000 MB (UNet + VAE + encoder + activations)
+#   PER_FRAME_MB   ≈ 4 MB at 1024x576 fp16 (input + intermediate latents)
+#
+# Stage 2 (Inpaint) is roughly constant in frames within a chunk; peak scales with 1/tile_num^2.
+# Empirically: tile_num=2 ≈ 14 GB; tile_num=3 ≈ 8 GB; tile_num=4 ≈ 5 GB.
+auto_configure() {
+  local free
+  free=$(detect_min_free_vram_mb)
+  if [ "$free" -le 0 ]; then
+    log "auto: nvidia-smi unavailable; keeping defaults chunk=$CHUNK_FRAMES tile=$TILE_NUM"
+    return
+  fi
+  if [ "$CHUNK_FRAMES_AUTO" = "1" ]; then
+    local usable=$(( free * 80 / 100 ))
+    local model_overhead=12000
+    local per_frame=4
+    local c=$(( (usable - model_overhead) / per_frame ))
+    [ "$c" -lt 64 ]   && c=64
+    [ "$c" -gt 1024 ] && c=1024
+    CHUNK_FRAMES="$c"
+  fi
+  if [ "$TILE_NUM_AUTO" = "1" ]; then
+    if   [ "$free" -ge 18000 ]; then TILE_NUM=2
+    elif [ "$free" -ge 10000 ]; then TILE_NUM=3
+    else                             TILE_NUM=4
+    fi
+  fi
+  log "auto: min_free=${free}MB → chunk_frames=$CHUNK_FRAMES tile_num=$TILE_NUM (override with STEREOCRAFTER_CHUNK_FRAMES / STEREOCRAFTER_TILE_NUM)"
+}
+
+# Run one full pipeline pass on a single GPU. Args: <in_abs> <out_abs> <base>
+# Honors $STEREOCRAFTER_GPU (set by caller) for GPU pinning.
+convert_single() {
+  local in_abs="$1" out_abs="$2" base="$3"
+  local in_dir; in_dir="$(dirname "$in_abs")"
+  local in_name; in_name="$(basename "$in_abs")"
+
+  local gpu_label="${STEREOCRAFTER_GPU:-all}"
+  log "[gpu=$gpu_label] pipeline: $in_name -> ${base}_{sbs,anaglyph}.mp4"
+  prun \
+    -v "$in_dir:/work_in:ro" \
+    -v "$out_abs:/work_out" \
+    -e "STC_CHUNK_FRAMES=$CHUNK_FRAMES" \
+    -e "STC_TILE_NUM=$TILE_NUM" \
+    -e "STC_KEEP_CHUNKS=$KEEP_CHUNKS" \
+    -e "STC_INPUT=/work_in/$in_name" \
+    -e "STC_BASE=$base" \
+    -- bash -c "$CONTAINER_PIPELINE_SCRIPT"
+}
+
+cmd_convert() {
+  [ "$#" -ge 1 ] || die "usage: $0 convert <input.mp4> [output_dir]"
+  ensure_image; ensure_weights
+  local in_video="$1"
+  local out_dir="${2:-$OUTPUT}"
+
+  local in_abs; in_abs="$(realpath "$in_video")"; [ -f "$in_abs" ] || die "no such file: $in_video"
+  local in_name; in_name="$(basename "$in_abs")"
+  local base="${in_name%.*}"
+
+  mkdir -p "$out_dir"
+  local out_abs; out_abs="$(realpath "$out_dir")"
+
+  auto_configure
+
+  # Decide single vs multi-GPU.
+  # - User pinned a specific GPU via STEREOCRAFTER_GPU: single GPU.
+  # - Only one GPU visible: single GPU.
+  # - Multiple GPUs and a long-enough input: split N ways, run in parallel.
+  local n_gpus=1
+  if [ -z "${STEREOCRAFTER_GPU:-}" ]; then
+    n_gpus="$(detect_gpu_count)"
+    [ "$n_gpus" -ge 1 ] || n_gpus=1
+  fi
+
+  if [ "$n_gpus" -le 1 ]; then
+    log "single-GPU pipeline: $in_name (tile_num=$TILE_NUM, chunk_frames=$CHUNK_FRAMES)"
+    convert_single "$in_abs" "$out_abs" "$base"
+    log "done. outputs in: $out_abs"
+    return
+  fi
+
+  # Multi-GPU path: probe frame count first to decide if splitting is worthwhile.
+  local total_frames
+  total_frames=$(probe_frames "$in_abs")
+  local min_for_split=$(( CHUNK_FRAMES * 2 ))
+  if [ "$total_frames" -lt "$min_for_split" ]; then
+    log "$total_frames frames < ${min_for_split} (2*chunk_frames) — single-GPU path"
+    convert_single "$in_abs" "$out_abs" "$base"
+    log "done. outputs in: $out_abs"
+    return
+  fi
+
+  log "multi-GPU pipeline: $n_gpus GPUs, $total_frames frames, tile_num=$TILE_NUM"
+  convert_multi "$in_abs" "$out_abs" "$base" "$n_gpus" "$total_frames"
+  log "done. outputs in: $out_abs"
+}
+
+# Probe total frame count of a video (runs ffprobe in a quick container).
+probe_frames() {
+  local in_abs="$1"
+  local in_dir; in_dir="$(dirname "$in_abs")"
+  local in_name; in_name="$(basename "$in_abs")"
+  # No GPU needed for this; bypass prun() to skip token/cache setup.
+  podman run --rm -i \
+    -v "$in_dir:/in:ro" \
+    "$IMAGE" \
+    ffprobe -v error -select_streams v -count_frames \
+      -show_entries stream=nb_read_frames -of csv=p=0 "/in/$in_name" \
+    | tr -d '\r\n'
+}
+
+# Split input into N parts (one per GPU) and run them in parallel.
+# Args: <in_abs> <out_abs> <base> <n_gpus> <total_frames>
+convert_multi() {
+  local in_abs="$1" out_abs="$2" base="$3" n_gpus="$4" total_frames="$5"
+  local in_dir; in_dir="$(dirname "$in_abs")"
+  local in_name; in_name="$(basename "$in_abs")"
+
+  local parts_dir="$out_abs/.parts_$base"
+  rm -rf "$parts_dir"; mkdir -p "$parts_dir"
+
+  # Split with ffmpeg (in container) into N approximately-equal parts.
+  # Frames per part rounded up so the last part may be slightly shorter.
+  local frames_per_part=$(( (total_frames + n_gpus - 1) / n_gpus ))
+  log "splitting into $n_gpus parts of ~${frames_per_part} frames each"
+
+  podman run --rm \
+    -v "$in_dir:/in:ro" \
+    -v "$parts_dir:/parts" \
+    "$IMAGE" \
+    bash -c "
+      set -e
+      fps_frac=\$(ffprobe -v error -select_streams v \
+        -show_entries stream=r_frame_rate -of csv=p=0 '/in/$in_name')
+      fps=\$(awk -F/ 'NR==1 { if (NF==2) printf \"%.9f\", \$1/\$2; else print \$1 }' <<< \"\$fps_frac\")
+      part_dur=\$(awk \"BEGIN{ printf \\\"%.9f\\\", $frames_per_part/\$fps }\")
+      ffmpeg -hide_banner -loglevel error -y \
+        -i '/in/$in_name' \
+        -force_key_frames \"expr:eq(mod(n,$frames_per_part),0)\" \
+        -c:v libx264 -preset veryfast -crf 17 -pix_fmt yuv420p \
+        -an \
+        -f segment -segment_time \"\$part_dur\" -segment_format mp4 \
+        -reset_timestamps 1 \
+        '/parts/part_%04d.mp4'
+    "
+
+  local parts=( "$parts_dir"/part_*.mp4 )
+  [ "${#parts[@]}" -ge 1 ] || die "ffmpeg produced no parts"
+
+  # ffmpeg's segment muxer can emit a 1–N-frame trailing part due to keyframe/timestamp
+  # rounding; DepthCrafter crashes on inputs shorter than its window+overlap (≈70+25 frames).
+  # Drop any tail parts with < MIN_PART_FRAMES; those lost frames are imperceptible (< 1 s).
+  local MIN_PART_FRAMES=32
+  while [ "${#parts[@]}" -gt 1 ]; do
+    local last="${parts[-1]}"
+    local nb; nb=$(probe_frames "$last")
+    [ -n "$nb" ] && [ "$nb" -ge "$MIN_PART_FRAMES" ] && break
+    log "dropping trailing tiny part $(basename "$last") (${nb:-?} frames < $MIN_PART_FRAMES)"
+    rm -f "$last"
+    parts=( "${parts[@]:0:${#parts[@]}-1}" )
+  done
+
+  log "split produced ${#parts[@]} parts; launching ${#parts[@]} parallel pipelines"
+
+  # Launch N pipelines in parallel, each pinned to one GPU.
+  # If ffmpeg emitted fewer parts than n_gpus (very short tail), each still gets its own GPU.
+  local pids=()
+  local i=0
+  for part in "${parts[@]}"; do
+    local gpu_idx=$(( i % n_gpus ))
+    local part_base="${base}__p$(printf '%02d' $i)"
+    (
+      STEREOCRAFTER_GPU="$gpu_idx"
+      convert_single "$part" "$parts_dir" "$part_base" \
+        > "$parts_dir/${part_base}.log" 2>&1
+    ) &
+    pids+=( $! )
+    i=$(( i + 1 ))
+  done
+
+  # Wait for all, fail loud if any died.
+  local failed=0
+  for pid in "${pids[@]}"; do
+    if ! wait "$pid"; then
+      failed=1
+    fi
+  done
+  if [ "$failed" -ne 0 ]; then
+    log "one or more parallel pipelines failed; per-part logs in: $parts_dir/*.log"
+    return 1
+  fi
+
+  # Concat the per-part SBS + anaglyph outputs.
+  log "concatenating ${#parts[@]} parts into $base"
+  local list_sbs="$parts_dir/list_sbs.txt"
+  local list_ana="$parts_dir/list_ana.txt"
+  : > "$list_sbs"; : > "$list_ana"
+  for ((j=0; j<${#parts[@]}; j++)); do
+    local part_base="${base}__p$(printf '%02d' $j)"
+    printf "file %s\n" "/work_out/${part_base}_sbs.mp4"      >> "$list_sbs"
+    printf "file %s\n" "/work_out/${part_base}_anaglyph.mp4" >> "$list_ana"
+  done
+
+  podman run --rm \
+    -v "$parts_dir:/work_out" \
+    -v "$out_abs:/final" \
+    "$IMAGE" \
+    bash -c "
+      set -e
+      ffmpeg -hide_banner -loglevel error -y \
+        -f concat -safe 0 -i /work_out/list_sbs.txt -c copy /final/${base}_sbs.mp4
+      ffmpeg -hide_banner -loglevel error -y \
+        -f concat -safe 0 -i /work_out/list_ana.txt -c copy /final/${base}_anaglyph.mp4
+    "
+
+  if [ "$KEEP_CHUNKS" != "1" ]; then
+    log "cleaning up $parts_dir (STEREOCRAFTER_KEEP_CHUNKS=1 to keep)"
+    rm -rf "$parts_dir"
+  fi
+}
+
+# In-container orchestration script (single-GPU run, with per-chunk inner splitting).
+# Defined as a module-level variable so convert_single can pass it inline.
+CONTAINER_PIPELINE_SCRIPT='
+set -euo pipefail
+INPUT="$STC_INPUT"
+OUT=/work_out
+BASE="$STC_BASE"
+CHUNK_FRAMES="$STC_CHUNK_FRAMES"
+TILE_NUM="$STC_TILE_NUM"
+
+WEIGHTS_BASE=/workspace/weights/stable-video-diffusion-img2vid-xt-1-1
+WEIGHTS_DEPTH=/workspace/weights/DepthCrafter
+WEIGHTS_INPAINT=/workspace/weights/StereoCrafter
+
+CURRENT_TILE_NUM="$TILE_NUM"
+
+# try_pair runs one (depth, inpaint) pass. Returns 0 = ok, 1 = non-OOM error, 2 = OOM.
+try_pair() {
+  local in_clip="$1" splat="$2" save_dir="$3"
+  local err
+  err=$(mktemp)
+  if ! python depth_splatting_inference.py \
+       --pre_trained_path "$WEIGHTS_BASE" \
+       --unet_path "$WEIGHTS_DEPTH" \
+       --input_video_path "$in_clip" \
+       --output_video_path "$splat" 2> "$err"; then
+    if grep -qE "OutOfMemoryError|out of memory" "$err"; then
+      tail -3 "$err" >&2; rm -f "$err"; return 2
+    fi
+    cat "$err" >&2; rm -f "$err"; return 1
+  fi
+  if ! python inpainting_inference.py \
+       --pre_trained_path "$WEIGHTS_BASE" \
+       --unet_path "$WEIGHTS_INPAINT" \
+       --input_video_path "$splat" \
+       --save_dir "$save_dir" \
+       --tile_num "$CURRENT_TILE_NUM" 2> "$err"; then
+    if grep -qE "OutOfMemoryError|out of memory" "$err"; then
+      tail -3 "$err" >&2; rm -f "$err"; return 2
+    fi
+    cat "$err" >&2; rm -f "$err"; return 1
+  fi
+  rm -f "$err"; return 0
+}
+
+# process_chunk: produces ${save_dir}/${stem}_splat_inpainting_results_{sbs,anaglyph}.mp4.
+# On OOM, splits the input chunk in half via ffmpeg, recurses, and concatenates the two outputs.
+# After the first OOM in a run, also bumps TILE_NUM for the rest of this stem to lower stage-2 peak.
+process_chunk() {
+  local chunk="$1" stem="$2" save_dir="$3" depth="${4:-0}"
+  local rc=0
+  try_pair "$chunk" "$save_dir/${stem}_splat.mp4" "$save_dir" || rc=$?
+  if [ "$rc" -eq 0 ]; then return 0; fi
+  if [ "$rc" -ne 2 ]; then return $rc; fi  # non-OOM, give up
+
+  if [ "$depth" -ge 3 ]; then
+    echo ">> OOM persists after $depth retry-splits on $stem; giving up" >&2
+    return 1
+  fi
+
+  # Bump tile_num once if it'\''s still low — helps stage 2 fit.
+  if [ "$CURRENT_TILE_NUM" -lt 4 ]; then
+    CURRENT_TILE_NUM=$(( CURRENT_TILE_NUM + 1 ))
+    echo ">> OOM on $stem; bumped tile_num to $CURRENT_TILE_NUM for the rest of this run" >&2
+  fi
+
+  local nb fps_frac fps subdur half
+  nb=$(ffprobe -v error -select_streams v -count_frames \
+        -show_entries stream=nb_read_frames -of csv=p=0 "$chunk")
+  half=$(( nb / 2 ))
+  # Match MIN_CHUNK_FRAMES — DepthCrafter needs >=32 frames to populate its window.
+  if [ "$half" -lt 32 ]; then
+    echo ">> chunk $stem too small to subdivide further ($nb frames; half would be $half < 32)" >&2
+    return 1
+  fi
+  fps_frac=$(ffprobe -v error -select_streams v -show_entries stream=r_frame_rate -of csv=p=0 "$chunk")
+  fps=$(awk -F/ "NR==1 { if (NF==2) printf \"%.9f\", \$1/\$2; else print \$1 }" <<< "$fps_frac")
+  subdur=$(awk "BEGIN{ printf \"%.9f\", $half/$fps }")
+
+  local sub_dir="$save_dir/sub_$stem"
+  rm -rf "$sub_dir"; mkdir -p "$sub_dir"
+  echo ">> OOM-retry: splitting $stem ($nb frames) into halves of ~$half" >&2
+  ffmpeg -hide_banner -loglevel error -y -i "$chunk" \
+    -force_key_frames "expr:eq(mod(n,$half),0)" \
+    -c:v libx264 -preset veryfast -crf 17 -pix_fmt yuv420p -an \
+    -f segment -segment_time "$subdur" -segment_format mp4 -reset_timestamps 1 \
+    "$sub_dir/s%04d.mp4"
+
+  local subs=( "$sub_dir"/s*.mp4 )
+  local k=0
+  for sub in "${subs[@]}"; do
+    process_chunk "$sub" "${stem}_s$(printf '%02d' $k)" "$save_dir" $((depth+1)) || return 1
+    k=$((k+1))
+  done
+
+  # Concat sub-outputs into a single chunk output, identical naming to a non-retry chunk.
+  local list_sbs="$sub_dir/list_sbs.txt" list_ana="$sub_dir/list_ana.txt"
+  : > "$list_sbs"; : > "$list_ana"
+  for ((j=0; j<${#subs[@]}; j++)); do
+    local s="${stem}_s$(printf '%02d' $j)"
+    printf "file %s\n" "$save_dir/${s}_splat_inpainting_results_sbs.mp4"      >> "$list_sbs"
+    printf "file %s\n" "$save_dir/${s}_splat_inpainting_results_anaglyph.mp4" >> "$list_ana"
+  done
+  ffmpeg -hide_banner -loglevel error -y -f concat -safe 0 -i "$list_sbs" -c copy \
+    "$save_dir/${stem}_splat_inpainting_results_sbs.mp4"
+  ffmpeg -hide_banner -loglevel error -y -f concat -safe 0 -i "$list_ana" -c copy \
+    "$save_dir/${stem}_splat_inpainting_results_anaglyph.mp4"
+
+  # Tidy sub-files.
+  rm -rf "$sub_dir"
+  for ((j=0; j<${#subs[@]}; j++)); do
+    local s="${stem}_s$(printf '%02d' $j)"
+    rm -f "$save_dir/${s}_splat.mp4" \
+          "$save_dir/${s}_splat_inpainting_results_sbs.mp4" \
+          "$save_dir/${s}_splat_inpainting_results_anaglyph.mp4"
+  done
+  return 0
+}
+
+run_pair() {
+  process_chunk "$1" "$(basename "${2%_splat.mp4}")" "$3"
+}
+
+nb_frames=$(ffprobe -v error -select_streams v -count_frames \
+  -show_entries stream=nb_read_frames -of csv=p=0 "$INPUT")
+echo ">> input frames: $nb_frames"
+
+if [ "$CHUNK_FRAMES" = "0" ] || [ "$nb_frames" -le "$CHUNK_FRAMES" ]; then
+  echo ">> single-pass (no chunking)"
+  run_pair "$INPUT" "$OUT/${BASE}_splat.mp4" "$OUT"
+  # Single-pass produces ${BASE}_splat_inpainting_results_{sbs,anaglyph}.mp4.
+  # Rename to ${BASE}_{sbs,anaglyph}.mp4 so the output filenames are uniform with the chunked path.
+  mv -f "$OUT/${BASE}_splat_inpainting_results_sbs.mp4"      "$OUT/${BASE}_sbs.mp4"
+  mv -f "$OUT/${BASE}_splat_inpainting_results_anaglyph.mp4" "$OUT/${BASE}_anaglyph.mp4"
+  [ "$STC_KEEP_CHUNKS" = "1" ] || rm -f "$OUT/${BASE}_splat.mp4"
+  exit 0
+fi
+
+CHUNK_DIR="$OUT/.chunks_$BASE"
+mkdir -p "$CHUNK_DIR"
+echo ">> chunking into $CHUNK_DIR (chunk_frames=$CHUNK_FRAMES)"
+
+fps_frac=$(ffprobe -v error -select_streams v \
+  -show_entries stream=r_frame_rate -of csv=p=0 "$INPUT")
+fps=$(awk -F/ "NR==1 { if (NF==2) printf \"%.9f\", \$1/\$2; else print \$1 }" <<< "$fps_frac")
+chunk_dur=$(awk "BEGIN{ printf \"%.9f\", $CHUNK_FRAMES/$fps }")
+echo ">> fps=$fps chunk_dur=${chunk_dur}s"
+
+# One-pass split: force keyframes every CHUNK_FRAMES frames, segment by duration.
+# Re-encoded with libx264 (visually lossless) so all chunks share codec params,
+# which is required for the final `-c copy` concat.
+ffmpeg -hide_banner -loglevel error -y \
+  -i "$INPUT" \
+  -force_key_frames "expr:eq(mod(n,$CHUNK_FRAMES),0)" \
+  -c:v libx264 -preset veryfast -crf 17 -pix_fmt yuv420p \
+  -an \
+  -f segment -segment_time "$chunk_dur" -segment_format mp4 \
+  -reset_timestamps 1 \
+  "$CHUNK_DIR/c%04d.mp4"
+chunks=( "$CHUNK_DIR"/c*.mp4 )
+# Drop any 1-N-frame trailing chunk from ffmpeg rounding; DepthCrafter crashes on
+# inputs shorter than its window. 32 frames is the floor; lost frames are < 1 s.
+MIN_CHUNK_FRAMES=32
+while [ "${#chunks[@]}" -gt 1 ]; do
+  last="${chunks[-1]}"
+  nb_last=$(ffprobe -v error -select_streams v -count_frames \
+    -show_entries stream=nb_read_frames -of csv=p=0 "$last")
+  [ -n "$nb_last" ] && [ "$nb_last" -ge "$MIN_CHUNK_FRAMES" ] && break
+  echo ">> dropping trailing tiny chunk $(basename "$last") (${nb_last:-?} frames < $MIN_CHUNK_FRAMES)"
+  rm -f "$last"
+  chunks=( "${chunks[@]:0:${#chunks[@]}-1}" )
+done
+echo ">> split into ${#chunks[@]} chunks"
+
+i=0
+for chunk in "${chunks[@]}"; do
+  i=$((i+1))
+  name=$(basename "${chunk%.mp4}")
+  echo ">> [$i/${#chunks[@]}] processing $name"
+  run_pair "$chunk" "$CHUNK_DIR/${name}_splat.mp4" "$CHUNK_DIR"
+done
+
+echo ">> concatenating ${#chunks[@]} chunks"
+list_sbs="$CHUNK_DIR/list_sbs.txt"
+list_ana="$CHUNK_DIR/list_ana.txt"
+: > "$list_sbs"; : > "$list_ana"
+for chunk in "${chunks[@]}"; do
+  name=$(basename "${chunk%.mp4}")
+  printf "file %s\n" "$CHUNK_DIR/${name}_splat_inpainting_results_sbs.mp4" >> "$list_sbs"
+  printf "file %s\n" "$CHUNK_DIR/${name}_splat_inpainting_results_anaglyph.mp4" >> "$list_ana"
+done
+ffmpeg -hide_banner -loglevel error -y \
+  -f concat -safe 0 -i "$list_sbs" -c copy "$OUT/${BASE}_sbs.mp4"
+ffmpeg -hide_banner -loglevel error -y \
+  -f concat -safe 0 -i "$list_ana" -c copy "$OUT/${BASE}_anaglyph.mp4"
+
+if [ "$STC_KEEP_CHUNKS" != "1" ]; then
+  echo ">> cleaning up $CHUNK_DIR (STEREOCRAFTER_KEEP_CHUNKS=1 to keep)"
+  rm -rf "$CHUNK_DIR"
+fi
+
+echo ">> outputs: $OUT/${BASE}_sbs.mp4 + $OUT/${BASE}_anaglyph.mp4"
+'
+
+cmd_shell() {
+  ensure_image
+  mkdir -p "$OUTPUT"
+  prun \
+    -v "$OUTPUT:/work_out" \
+    -- bash
+}
+
+cmd_status() {
+  echo "image:    $IMAGE  ($(image_exists && echo present || echo MISSING))"
+  echo "weights:  $WEIGHTS"
+  for entry in "${HF_REPOS[@]}"; do
+    local dir="${entry##*:}"
+    if [ -d "$WEIGHTS/$dir" ] && [ -n "$(ls -A "$WEIGHTS/$dir" 2>/dev/null)" ]; then
+      printf '  [x] %s (%s)\n' "$dir" "$(du -sh "$WEIGHTS/$dir" 2>/dev/null | cut -f1)"
+    else
+      printf '  [ ] %s\n' "$dir"
+    fi
+  done
+  echo "output:   $OUTPUT"
+}
+
+main() {
+  local sub="${1:-help}"; shift || true
+  case "$sub" in
+    build)        cmd_build "$@" ;;
+    pull-weights) cmd_pull_weights "$@" ;;
+    convert)      cmd_convert "$@" ;;
+    splat)        cmd_splat "$@" ;;
+    inpaint)      cmd_inpaint "$@" ;;
+    shell)        cmd_shell "$@" ;;
+    status)       cmd_status "$@" ;;
+    -h|--help|help) usage 0 ;;
+    *) echo "unknown subcommand: $sub" >&2; usage 1 ;;
+  esac
+}
+
+main "$@"
