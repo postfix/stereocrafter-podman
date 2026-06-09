@@ -337,37 +337,38 @@ cmd_convert() {
 
   auto_configure
 
+  # Probe up front so we can print pre-flight estimate.
+  local probe; probe=$(probe_video "$in_abs")
+  local total_frames width height
+  IFS=, read -r total_frames width height <<< "$probe"
+  if ! [[ "$total_frames" =~ ^[0-9]+$ ]] || [ "$total_frames" -le 0 ]; then
+    die "ffprobe could not determine frame count for $in_abs"
+  fi
+  log "input: $total_frames frames @ ${width}×${height}"
+
   # Decide single vs multi-GPU.
-  # - User pinned a specific GPU via STEREOCRAFTER_GPU: single GPU.
-  # - Only one GPU visible: single GPU.
-  # - Multiple GPUs and a long-enough input: split N ways, run in parallel.
   local n_gpus=1
   if [ -z "${STEREOCRAFTER_GPU:-}" ]; then
-    n_gpus="$(detect_gpu_count)"
-    [ "$n_gpus" -ge 1 ] || n_gpus=1
+    n_gpus="$(detect_gpu_count)"; [ "$n_gpus" -ge 1 ] || n_gpus=1
   fi
+  local eta; eta=$(estimate_wall_seconds "$total_frames" "$width" "$height")
+  log "estimated wall time: ~$(format_duration "$eta") (rough; updates after first chunk)"
+
+  local convert_start; convert_start=$(date +%s)
 
   if [ "$n_gpus" -le 1 ]; then
-    log "single-GPU pipeline: $in_name (tile_num=$TILE_NUM, chunk_frames=$CHUNK_FRAMES)"
+    log "single-GPU pipeline (tile_num=$TILE_NUM, chunk_frames=$CHUNK_FRAMES)"
     convert_single "$in_abs" "$out_abs" "$base"
-    log "done. outputs in: $out_abs"
-    return
+  elif [ "$total_frames" -lt "$(( CHUNK_FRAMES * 2 ))" ]; then
+    log "$total_frames frames < $(( CHUNK_FRAMES * 2 )) (2×chunk_frames) — single-GPU path"
+    convert_single "$in_abs" "$out_abs" "$base"
+  else
+    log "multi-GPU pipeline: $n_gpus GPUs, tile_num=$TILE_NUM, chunk_frames=$CHUNK_FRAMES"
+    convert_multi "$in_abs" "$out_abs" "$base" "$n_gpus" "$total_frames"
   fi
 
-  # Multi-GPU path: probe frame count first to decide if splitting is worthwhile.
-  local total_frames
-  total_frames=$(probe_frames "$in_abs")
-  local min_for_split=$(( CHUNK_FRAMES * 2 ))
-  if [ "$total_frames" -lt "$min_for_split" ]; then
-    log "$total_frames frames < ${min_for_split} (2*chunk_frames) — single-GPU path"
-    convert_single "$in_abs" "$out_abs" "$base"
-    log "done. outputs in: $out_abs"
-    return
-  fi
-
-  log "multi-GPU pipeline: $n_gpus GPUs, $total_frames frames, tile_num=$TILE_NUM"
-  convert_multi "$in_abs" "$out_abs" "$base" "$n_gpus" "$total_frames"
-  log "done. outputs in: $out_abs"
+  local elapsed=$(( $(date +%s) - convert_start ))
+  log "done in $(format_duration "$elapsed"). outputs in: $out_abs"
 }
 
 # Probe total frame count of a video (runs ffprobe in a quick container).
@@ -382,6 +383,46 @@ probe_frames() {
     ffprobe -v error -select_streams v -count_frames \
       -show_entries stream=nb_read_frames -of csv=p=0 "/in/$in_name" \
     | tr -d '\r\n'
+}
+
+# Probe frame count + WxH in one pass. Echoes "<frames>,<w>,<h>".
+probe_video() {
+  local in_abs="$1"
+  local in_dir; in_dir="$(dirname "$in_abs")"
+  local in_name; in_name="$(basename "$in_abs")"
+  podman run --rm -i \
+    -v "$in_dir:/in:ro" \
+    "$IMAGE" \
+    ffprobe -v error -select_streams v -count_frames \
+      -show_entries stream=nb_read_frames,width,height -of csv=p=0 "/in/$in_name" \
+    | tr -d '\r\n'
+}
+
+# Pretty-print a duration in seconds as "Xd Yh", "Xh Ym", "Xm Ys", or "Xs".
+format_duration() {
+  local s="$1"
+  if   [ "$s" -lt 60 ];    then printf "%ds" "$s"
+  elif [ "$s" -lt 3600 ];  then printf "%dm %ds" $((s/60)) $((s%60))
+  elif [ "$s" -lt 86400 ]; then printf "%dh %dm" $((s/3600)) $(((s%3600)/60))
+  else                          printf "%dd %dh" $((s/86400)) $(((s%86400)/3600))
+  fi
+}
+
+# Empirical wall-time estimate. Baseline (auto-config, 2× RTX 3090, 1080p): ~4 s/frame.
+# Scales linearly with input pixel area (stage 2 inpaint dominates).
+# Single-GPU is ~2× slower (no parallelism + less amortized model loading).
+estimate_wall_seconds() {
+  local frames="$1" w="$2" h="$3"
+  local px_in=$(( w * h ))
+  local px_1080p=$(( 1920 * 1080 ))
+  # 4.0 s/frame at 1080p, scale linearly. Use *10 to keep integer arithmetic.
+  local spf_x10=$(( 40 * px_in / px_1080p ))
+  [ "$spf_x10" -lt 10 ] && spf_x10=10
+  local n=1
+  if [ -z "${STEREOCRAFTER_GPU:-}" ]; then
+    n=$(detect_gpu_count); [ "$n" -lt 1 ] && n=1
+  fi
+  echo $(( frames * spf_x10 / 10 / n ))
 }
 
 # Split input into N parts (one per GPU) and run them in parallel.
@@ -437,10 +478,34 @@ convert_multi() {
 
   log "split produced ${#parts[@]} parts; launching ${#parts[@]} parallel pipelines"
 
-  # Launch N pipelines in parallel, each pinned to one GPU.
-  # If ffmpeg emitted fewer parts than n_gpus (very short tail), each still gets its own GPU.
-  local pids=()
+  # Pre-create per-part log files so `tail -F` can attach before they're written.
+  local log_files=()
   local i=0
+  for part in "${parts[@]}"; do
+    local part_base="${base}__p$(printf '%02d' $i)"
+    : > "$parts_dir/${part_base}.log"
+    log_files+=( "$parts_dir/${part_base}.log" )
+    i=$(( i + 1 ))
+  done
+
+  # Live progress watcher: stream `>>`-prefixed lines from every per-part log,
+  # prefixed with the part tag so output from concurrent GPUs is distinguishable.
+  # STEREOCRAFTER_VERBOSE=1 to show all container output (tqdm bars, model loads, …).
+  local watcher_pid=""
+  if [ "${STEREOCRAFTER_VERBOSE:-0}" = "1" ]; then
+    ( tail -qF "${log_files[@]}" 2>/dev/null ) &
+    watcher_pid=$!
+  else
+    ( tail -qF "${log_files[@]}" 2>/dev/null \
+        | grep --line-buffered -E '^>>' \
+        | sed -u 's/^>> /[part] /' \
+    ) &
+    watcher_pid=$!
+  fi
+
+  # Launch N pipelines in parallel, each pinned to one GPU.
+  local pids=()
+  i=0
   for part in "${parts[@]}"; do
     local gpu_idx=$(( i % n_gpus ))
     local part_base="${base}__p$(printf '%02d' $i)"
@@ -460,6 +525,12 @@ convert_multi() {
       failed=1
     fi
   done
+
+  # Stop the watcher.
+  if [ -n "$watcher_pid" ]; then
+    kill "$watcher_pid" 2>/dev/null || true
+    wait "$watcher_pid" 2>/dev/null || true
+  fi
   if [ "$failed" -ne 0 ]; then
     log "one or more parallel pipelines failed; per-part logs in: $parts_dir/*.log"
     return 1
@@ -554,11 +625,10 @@ process_chunk() {
     return 1
   fi
 
-  # Bump tile_num once if it'\''s still low — helps stage 2 fit.
-  if [ "$CURRENT_TILE_NUM" -lt 4 ]; then
-    CURRENT_TILE_NUM=$(( CURRENT_TILE_NUM + 1 ))
-    echo ">> OOM on $stem; bumped tile_num to $CURRENT_TILE_NUM for the rest of this run" >&2
-  fi
+  # Do NOT bump tile_num — higher tile_num produces tile dimensions that may not be
+  # divisible by 8 (VAE constraint), causing `check_inputs` to raise ValueError on
+  # arbitrary input resolutions. Chunk-splitting alone is enough to recover from OOM.
+  echo ">> OOM on $stem (depth $depth); will split chunk in half and retry" >&2
 
   local nb fps_frac fps subdur half
   nb=$(ffprobe -v error -select_streams v -count_frames \
@@ -668,12 +738,29 @@ while [ "${#chunks[@]}" -gt 1 ]; do
 done
 echo ">> split into ${#chunks[@]} chunks"
 
+fmt_dur() {
+  local s="$1"
+  if   [ "$s" -lt 60 ];   then printf "%ds" "$s"
+  elif [ "$s" -lt 3600 ]; then printf "%dm%ds" $((s/60)) $((s%60))
+  else                          printf "%dh%dm" $((s/3600)) $(((s%3600)/60))
+  fi
+}
+
+T_START=$(date +%s)
 i=0
 for chunk in "${chunks[@]}"; do
   i=$((i+1))
   name=$(basename "${chunk%.mp4}")
-  echo ">> [$i/${#chunks[@]}] processing $name"
+  echo ">> [$BASE] chunk $i/${#chunks[@]} ($name): starting"
+  c_start=$(date +%s)
   run_pair "$chunk" "$CHUNK_DIR/${name}_splat.mp4" "$CHUNK_DIR"
+  c_end=$(date +%s)
+  c_dur=$(( c_end - c_start ))
+  cum=$(( c_end - T_START ))
+  avg=$(( cum / i ))
+  remaining=$(( ${#chunks[@]} - i ))
+  eta=$(( avg * remaining ))
+  echo ">> [$BASE] chunk $i/${#chunks[@]} done in $(fmt_dur $c_dur); cum=$(fmt_dur $cum) avg=$(fmt_dur $avg)/chunk eta=$(fmt_dur $eta)"
 done
 
 echo ">> concatenating ${#chunks[@]} chunks"
