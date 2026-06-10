@@ -289,8 +289,11 @@ auto_configure() {
     local model_overhead=12000
     local per_frame=4
     local c=$(( (usable - model_overhead) / per_frame ))
-    [ "$c" -lt 64 ]   && c=64
-    [ "$c" -gt 1024 ] && c=1024
+    # Empirical cap: stage-2 inpaint at 24 GB OOMs above ~512 frames per chunk
+    # (intermediate latents + filter2d allocations grow per-frame regardless of
+    # input resolution). The OOM-retry path will subdivide if 512 is still too much.
+    [ "$c" -lt 64 ]  && c=64
+    [ "$c" -gt 512 ] && c=512
     CHUNK_FRAMES="$c"
   fi
   if [ "$TILE_NUM_AUTO" = "1" ]; then
@@ -450,16 +453,17 @@ format_duration() {
   fi
 }
 
-# Empirical wall-time estimate. Baseline (auto-config, 2× RTX 3090, 1080p): ~4 s/frame.
-# Scales linearly with input pixel area (stage 2 inpaint dominates).
-# Single-GPU is ~2× slower (no parallelism + less amortized model loading).
+# Empirical wall-time estimate. Two-term model fitted to observed runs on 2× RTX 3090:
+#   ~2 s/frame fixed per-GPU cost (model load amortization + per-frame Python/IO) +
+#   ~2 s/frame at 1080p scaled by pixel area (stage 2 inpaint dominates).
+# Then divided by GPU count for parallel runs. Use *10 for integer arithmetic.
 estimate_wall_seconds() {
   local frames="$1" w="$2" h="$3"
   local px_in=$(( w * h ))
   local px_1080p=$(( 1920 * 1080 ))
-  # 4.0 s/frame at 1080p, scale linearly. Use *10 to keep integer arithmetic.
-  local spf_x10=$(( 40 * px_in / px_1080p ))
-  [ "$spf_x10" -lt 10 ] && spf_x10=10
+  local base_x10=20
+  local scaled_x10=$(( 20 * px_in / px_1080p ))
+  local spf_x10=$(( base_x10 + scaled_x10 ))
   local n=1
   if [ -z "${STEREOCRAFTER_GPU:-}" ]; then
     n=$(detect_gpu_count); [ "$n" -lt 1 ] && n=1
@@ -520,41 +524,28 @@ convert_multi() {
 
   log "split produced ${#parts[@]} parts; launching ${#parts[@]} parallel pipelines"
 
-  # Pre-create per-part log files so `tail -F` can attach before they're written.
-  local log_files=()
-  local i=0
-  for part in "${parts[@]}"; do
-    local part_base="${base}__p$(printf '%02d' $i)"
-    : > "$parts_dir/${part_base}.log"
-    log_files+=( "$parts_dir/${part_base}.log" )
-    i=$(( i + 1 ))
-  done
-
-  # Live progress watcher: stream `>>`-prefixed lines from every per-part log,
-  # prefixed with the part tag so output from concurrent GPUs is distinguishable.
-  # STEREOCRAFTER_VERBOSE=1 to show all container output (tqdm bars, model loads, …).
-  local watcher_pid=""
-  if [ "${STEREOCRAFTER_VERBOSE:-0}" = "1" ]; then
-    ( tail -qF "${log_files[@]}" 2>/dev/null ) &
-    watcher_pid=$!
-  else
-    ( tail -qF "${log_files[@]}" 2>/dev/null \
-        | grep --line-buffered -E '^>>' \
-        | sed -u 's/^>> /[part] /' \
-    ) &
-    watcher_pid=$!
-  fi
-
-  # Launch N pipelines in parallel, each pinned to one GPU.
+  # Each subshell pipes its output through tee (-> log file) and a per-part
+  # prefixer (-> user's terminal). No `tail -F` watcher needed — every line is
+  # processed exactly once, so no duplicate-on-truncate artifacts.
+  # STEREOCRAFTER_VERBOSE=1 shows all container output (tqdm bars, model loads, …).
   local pids=()
-  i=0
+  local i=0
   for part in "${parts[@]}"; do
     local gpu_idx=$(( i % n_gpus ))
     local part_base="${base}__p$(printf '%02d' $i)"
+    local prefix="[p$(printf '%02d' $i)]"
     (
       STEREOCRAFTER_GPU="$gpu_idx"
-      convert_single "$part" "$parts_dir" "$part_base" \
-        > "$parts_dir/${part_base}.log" 2>&1
+      if [ "${STEREOCRAFTER_VERBOSE:-0}" = "1" ]; then
+        convert_single "$part" "$parts_dir" "$part_base" 2>&1 \
+          | tee "$parts_dir/${part_base}.log" \
+          | sed -u "s/^/$prefix /"
+      else
+        convert_single "$part" "$parts_dir" "$part_base" 2>&1 \
+          | tee "$parts_dir/${part_base}.log" \
+          | grep --line-buffered -E '^>>' \
+          | sed -u "s/^>> /$prefix /"
+      fi
     ) &
     pids+=( $! )
     i=$(( i + 1 ))
@@ -567,39 +558,38 @@ convert_multi() {
       failed=1
     fi
   done
-
-  # Stop the watcher.
-  if [ -n "$watcher_pid" ]; then
-    kill "$watcher_pid" 2>/dev/null || true
-    wait "$watcher_pid" 2>/dev/null || true
-  fi
   if [ "$failed" -ne 0 ]; then
     log "one or more parallel pipelines failed; per-part logs in: $parts_dir/*.log"
     return 1
   fi
 
   # Concat the per-part SBS + anaglyph outputs.
+  # Use bare filenames (no /work_out/ prefix) + cwd inside the list-file dir, so
+  # ffmpeg's concat demuxer doesn't path-split on the spaces in ${base}.
   log "concatenating ${#parts[@]} parts into $base"
   local list_sbs="$parts_dir/list_sbs.txt"
   local list_ana="$parts_dir/list_ana.txt"
   : > "$list_sbs"; : > "$list_ana"
   for ((j=0; j<${#parts[@]}; j++)); do
     local part_base="${base}__p$(printf '%02d' $j)"
-    printf "file %s\n" "/work_out/${part_base}_sbs.mp4"      >> "$list_sbs"
-    printf "file %s\n" "/work_out/${part_base}_anaglyph.mp4" >> "$list_ana"
+    printf "file %s\n" "${part_base}_sbs.mp4"      >> "$list_sbs"
+    printf "file %s\n" "${part_base}_anaglyph.mp4" >> "$list_ana"
   done
 
+  # The output filename ${base}.mp4 has spaces; quote it inside the container script.
   podman run --rm \
     -v "$parts_dir:/work_out" \
     -v "$out_abs:/final" \
+    -e "STC_BASE=$base" \
     "$IMAGE" \
-    bash -c "
+    bash -c '
       set -e
+      cd /work_out
       ffmpeg -hide_banner -loglevel error -y \
-        -f concat -safe 0 -i /work_out/list_sbs.txt -c copy /final/${base}_sbs.mp4
+        -f concat -safe 0 -i list_sbs.txt -c copy "/final/${STC_BASE}_sbs.mp4"
       ffmpeg -hide_banner -loglevel error -y \
-        -f concat -safe 0 -i /work_out/list_ana.txt -c copy /final/${base}_anaglyph.mp4
-    "
+        -f concat -safe 0 -i list_ana.txt -c copy "/final/${STC_BASE}_anaglyph.mp4"
+    '
 
   if [ "$KEEP_CHUNKS" != "1" ]; then
     log "cleaning up $parts_dir (STEREOCRAFTER_KEEP_CHUNKS=1 to keep)"
@@ -702,17 +692,20 @@ process_chunk() {
   done
 
   # Concat sub-outputs into a single chunk output, identical naming to a non-retry chunk.
+  # ffmpeg concat demuxer splits unquoted paths on whitespace; single-quote each path
+  # and run with cwd at $save_dir so the list entries are bare filenames (the chunk
+  # names we generate never contain spaces).
   local list_sbs="$sub_dir/list_sbs.txt" list_ana="$sub_dir/list_ana.txt"
   : > "$list_sbs"; : > "$list_ana"
   for ((j=0; j<${#subs[@]}; j++)); do
-    local s="${stem}_s$(printf '%02d' $j)"
-    printf "file %s\n" "$save_dir/${s}_splat_inpainting_results_sbs.mp4"      >> "$list_sbs"
-    printf "file %s\n" "$save_dir/${s}_splat_inpainting_results_anaglyph.mp4" >> "$list_ana"
+    local s="${stem}_s$(printf "%02d" $j)"
+    printf "file ../%s\n" "${s}_splat_inpainting_results_sbs.mp4"      >> "$list_sbs"
+    printf "file ../%s\n" "${s}_splat_inpainting_results_anaglyph.mp4" >> "$list_ana"
   done
-  ffmpeg -hide_banner -loglevel error -y -f concat -safe 0 -i "$list_sbs" -c copy \
-    "$save_dir/${stem}_splat_inpainting_results_sbs.mp4"
-  ffmpeg -hide_banner -loglevel error -y -f concat -safe 0 -i "$list_ana" -c copy \
-    "$save_dir/${stem}_splat_inpainting_results_anaglyph.mp4"
+  ( cd "$sub_dir" && ffmpeg -hide_banner -loglevel error -y -f concat -safe 0 \
+      -i list_sbs.txt -c copy "../${stem}_splat_inpainting_results_sbs.mp4" )
+  ( cd "$sub_dir" && ffmpeg -hide_banner -loglevel error -y -f concat -safe 0 \
+      -i list_ana.txt -c copy "../${stem}_splat_inpainting_results_anaglyph.mp4" )
 
   # Tidy sub-files.
   rm -rf "$sub_dir"
@@ -811,13 +804,15 @@ list_ana="$CHUNK_DIR/list_ana.txt"
 : > "$list_sbs"; : > "$list_ana"
 for chunk in "${chunks[@]}"; do
   name=$(basename "${chunk%.mp4}")
-  printf "file %s\n" "$CHUNK_DIR/${name}_splat_inpainting_results_sbs.mp4" >> "$list_sbs"
-  printf "file %s\n" "$CHUNK_DIR/${name}_splat_inpainting_results_anaglyph.mp4" >> "$list_ana"
+  # Bare filenames (relative to $CHUNK_DIR); avoids ffmpeg concat-demuxer
+  # path-splitting on whitespace when $CHUNK_DIR has spaces.
+  printf "file %s\n" "${name}_splat_inpainting_results_sbs.mp4" >> "$list_sbs"
+  printf "file %s\n" "${name}_splat_inpainting_results_anaglyph.mp4" >> "$list_ana"
 done
-ffmpeg -hide_banner -loglevel error -y \
-  -f concat -safe 0 -i "$list_sbs" -c copy "$OUT/${BASE}_sbs.mp4"
-ffmpeg -hide_banner -loglevel error -y \
-  -f concat -safe 0 -i "$list_ana" -c copy "$OUT/${BASE}_anaglyph.mp4"
+( cd "$CHUNK_DIR" && ffmpeg -hide_banner -loglevel error -y \
+    -f concat -safe 0 -i list_sbs.txt -c copy "$OUT/${BASE}_sbs.mp4" )
+( cd "$CHUNK_DIR" && ffmpeg -hide_banner -loglevel error -y \
+    -f concat -safe 0 -i list_ana.txt -c copy "$OUT/${BASE}_anaglyph.mp4" )
 
 if [ "$STC_KEEP_CHUNKS" != "1" ]; then
   echo ">> cleaning up $CHUNK_DIR (STEREOCRAFTER_KEEP_CHUNKS=1 to keep)"
