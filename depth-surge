@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# depth-surge — podman wrapper for Tok/depth-surge-3d
+#
+# Subcommands:
+#   build                       Build the podman image (one-time, ~10–15 min)
+#   pull-weights [size]         Download depth-anything weights (size=small|base|large|all,
+#                               default: large). Public, no token needed.
+#   convert  <video> [out_dir]  Run depth_surge_3d.py → SBS or OU stereo MP4
+#   shell                       Interactive bash in the container
+#   status                      Image + weights state
+#
+# Layout (override with env vars):
+#   DEPTHSURGE_ROOT          project root            (default: dir of this script)
+#   DEPTHSURGE_WEIGHTS       weights dir             (default: $ROOT/weights/depth-surge)
+#   DEPTHSURGE_CACHE         cache dir (realesrgan)  (default: $ROOT/weights/depth-surge-cache)
+#   DEPTHSURGE_OUTPUT        default output dir      (default: $ROOT/output)
+#   DEPTHSURGE_IMAGE         image tag               (default: localhost/depth-surge:latest)
+#   DEPTHSURGE_GPU           pin to one GPU index    (default: first visible)
+#
+# Conversion knobs (passed through to depth_surge_3d.py):
+#   DEPTHSURGE_VERSION       v2 | v3                 (default: v2)
+#   DEPTHSURGE_MODEL         depth model name        (default: depth-anything/Depth-Anything-V2-Large)
+#   DEPTHSURGE_FORMAT        side_by_side | over_under  (default: side_by_side)
+#   DEPTHSURGE_RESOLUTION    VR-resolution string    (default: auto; see depth_surge_3d.py --list-resolutions)
+#   DEPTHSURGE_BASELINE      stereo baseline (m)     (default: 0.065)
+#   DEPTHSURGE_HOLE_FILL     fast | advanced         (default: fast)
+#   DEPTHSURGE_UPSCALE       none | x2 | x4 | x4-conservative  (default: none)
+#   DEPTHSURGE_EXTRA         extra args appended verbatim to depth_surge_3d.py invocation
+#   DEPTHSURGE_ANAGLYPH      set to 1 to also emit a red/cyan anaglyph mp4 via ffmpeg
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${DEPTHSURGE_ROOT:-$SCRIPT_DIR}"
+IMAGE="${DEPTHSURGE_IMAGE:-localhost/depth-surge:latest}"
+WEIGHTS="${DEPTHSURGE_WEIGHTS:-$ROOT/weights/depth-surge}"
+CACHE="${DEPTHSURGE_CACHE:-$ROOT/weights/depth-surge-cache}"
+OUTPUT="${DEPTHSURGE_OUTPUT:-$ROOT/output}"
+
+VERSION="${DEPTHSURGE_VERSION:-v2}"
+MODEL="${DEPTHSURGE_MODEL:-depth-anything/Depth-Anything-V2-Large}"
+FORMAT="${DEPTHSURGE_FORMAT:-side_by_side}"
+RESOLUTION="${DEPTHSURGE_RESOLUTION:-auto}"
+BASELINE="${DEPTHSURGE_BASELINE:-0.065}"
+HOLE_FILL="${DEPTHSURGE_HOLE_FILL:-fast}"
+UPSCALE="${DEPTHSURGE_UPSCALE:-none}"
+EXTRA="${DEPTHSURGE_EXTRA:-}"
+ANAGLYPH="${DEPTHSURGE_ANAGLYPH:-0}"
+
+die() { echo "error: $*" >&2; exit 1; }
+log() { echo ">> $*" >&2; }
+
+usage() {
+  sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+image_exists() { podman image exists "$IMAGE"; }
+
+# Tile model-size → on-disk dir (matches what depth-surge expects under ./models/).
+expected_model_dir() {
+  case "$1" in
+    small)  echo "$WEIGHTS/Depth-Anything-V2-Small" ;;
+    base)   echo "$WEIGHTS/Depth-Anything-V2-Base"  ;;
+    large)  echo "$WEIGHTS/Depth-Anything-V2-Large" ;;
+    *)      echo "$WEIGHTS/Depth-Anything-V2-Large" ;;
+  esac
+}
+
+ensure_image() {
+  image_exists || die "image $IMAGE not built — run: $0 build"
+}
+
+tty_flags() {
+  if [ -t 0 ] && [ -t 1 ]; then echo "-it"; else echo "-i"; fi
+}
+
+# Common podman invocation: GPU access, weights mount, cache mount.
+# Args: <extra-flags...> -- <image-cmd...>
+prun() {
+  local extra=()
+  while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
+    extra+=("$1"); shift
+  done
+  [ "${1:-}" = "--" ] && shift
+
+  mkdir -p "$WEIGHTS" "$CACHE"
+  local gpu_flag="nvidia.com/gpu=all"
+  [ -n "$GPU" ] && gpu_flag="nvidia.com/gpu=$GPU"
+  : "${GPU:=${DEPTHSURGE_GPU:-}}"
+  if [ -n "$GPU" ]; then gpu_flag="nvidia.com/gpu=$GPU"; fi
+
+  # shellcheck disable=SC2046
+  podman run --rm $(tty_flags) \
+    --device "$gpu_flag" \
+    -v "$WEIGHTS:/opt/depth-surge-3d/models" \
+    -v "$CACHE:/root/.cache/depth-surge-3d" \
+    -w /opt/depth-surge-3d \
+    "${extra[@]}" \
+    "$IMAGE" "$@"
+}
+
+cmd_build() {
+  [ -f "$ROOT/Dockerfile.depth-surge" ] || die "no Dockerfile.depth-surge at $ROOT/"
+  log "building $IMAGE from $ROOT/Dockerfile.depth-surge (~10–15 min)"
+  podman build -t "$IMAGE" -f "$ROOT/Dockerfile.depth-surge" "$ROOT"
+}
+
+cmd_pull_weights() {
+  ensure_image
+  local size="${1:-large}"
+  mkdir -p "$WEIGHTS"
+  log "downloading depth-anything weights ($size) into $WEIGHTS"
+  # The upstream script writes under ./models/; we mount the host weights dir there.
+  prun -- bash -c "
+    set -e
+    cd /opt/depth-surge-3d
+    bash ./scripts/download_models.sh '$size'
+  "
+  log "weights ready"
+}
+
+weights_ready() {
+  local dir; dir="$(expected_model_dir "${1:-large}")"
+  [ -d "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ]
+}
+
+ensure_weights() {
+  # Derive size from configured model name; default 'large'.
+  local size="large"
+  case "$MODEL" in
+    *Small*) size="small" ;;
+    *Base*)  size="base"  ;;
+    *Large*) size="large" ;;
+  esac
+  if ! weights_ready "$size"; then
+    log "weights for $size missing — running pull-weights"
+    cmd_pull_weights "$size"
+  fi
+}
+
+cmd_convert() {
+  [ "$#" -ge 1 ] || die "usage: $0 convert <input.mp4> [output_dir]"
+  ensure_image; ensure_weights
+  local in_video="$1"
+  local out_dir="${2:-$OUTPUT}"
+
+  local in_abs; in_abs="$(realpath "$in_video")"
+  [ -f "$in_abs" ] || die "no such file: $in_video"
+  local in_dir; in_dir="$(dirname "$in_abs")"
+  local in_name; in_name="$(basename "$in_abs")"
+
+  mkdir -p "$out_dir"
+  local out_abs; out_abs="$(realpath "$out_dir")"
+
+  log "depth-surge: $in_name (model=$MODEL version=$VERSION format=$FORMAT res=$RESOLUTION)"
+  local start_ts; start_ts=$(date +%s)
+
+  # shellcheck disable=SC2086
+  prun \
+    -v "$in_dir:/work_in:ro" \
+    -v "$out_abs:/work_out" \
+    -- python depth_surge_3d.py \
+        "/work_in/$in_name" \
+        --output-dir /work_out \
+        --depth-model-version "$VERSION" \
+        --model "$MODEL" \
+        --format "$FORMAT" \
+        --vr-resolution "$RESOLUTION" \
+        --baseline "$BASELINE" \
+        --hole-fill-quality "$HOLE_FILL" \
+        --upscale-model "$UPSCALE" \
+        --device cuda \
+        $EXTRA
+
+  local elapsed=$(( $(date +%s) - start_ts ))
+  log "depth-surge done in ${elapsed}s. outputs in: $out_abs/<run_dir>/"
+
+  # Optional anaglyph from the SBS output (depth-surge doesn't emit one natively).
+  if [ "$ANAGLYPH" = "1" ] && [ "$FORMAT" = "side_by_side" ]; then
+    local sbs; sbs="$(find "$out_abs" -maxdepth 3 -name '*_SBS.mp4' -newer "$in_abs" 2>/dev/null | head -1)"
+    if [ -n "$sbs" ] && [ -f "$sbs" ]; then
+      local ana="${sbs%_SBS.mp4}_anaglyph.mp4"
+      log "rendering anaglyph from $sbs"
+      podman run --rm -v "$out_abs:/work_out" "$IMAGE" \
+        ffmpeg -hide_banner -loglevel error -y -i "/work_out/$(realpath --relative-to="$out_abs" "$sbs")" \
+          -filter_complex "[0:v]split=2[L][R];[L]crop=iw/2:ih:0:0,lutrgb=g=0:b=0[lr];[R]crop=iw/2:ih:iw/2:0,lutrgb=r=0[rc];[lr][rc]blend=all_mode=addition" \
+          -c:v libx264 -crf 18 -preset veryfast -an \
+          "/work_out/$(realpath --relative-to="$out_abs" "$ana")"
+      log "anaglyph: $ana"
+    fi
+  fi
+}
+
+cmd_shell() {
+  ensure_image
+  mkdir -p "$OUTPUT"
+  prun -v "$OUTPUT:/work_out" -- bash
+}
+
+cmd_status() {
+  echo "image:    $IMAGE  ($(image_exists && echo present || echo MISSING))"
+  echo "weights:  $WEIGHTS"
+  for size in small base large; do
+    local dir; dir="$(expected_model_dir "$size")"
+    if [ -d "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
+      printf '  [x] Depth-Anything-V2-%-6s (%s)\n' "$size" "$(du -sh "$dir" 2>/dev/null | cut -f1)"
+    else
+      printf '  [ ] Depth-Anything-V2-%-6s\n' "$size"
+    fi
+  done
+  echo "cache:    $CACHE"
+  echo "output:   $OUTPUT"
+  echo "settings: version=$VERSION model=$MODEL format=$FORMAT res=$RESOLUTION upscale=$UPSCALE"
+}
+
+main() {
+  local sub="${1:-help}"; shift || true
+  case "$sub" in
+    build)        cmd_build "$@" ;;
+    pull-weights) cmd_pull_weights "$@" ;;
+    convert)      cmd_convert "$@" ;;
+    shell)        cmd_shell "$@" ;;
+    status)       cmd_status "$@" ;;
+    -h|--help|help) usage 0 ;;
+    *) echo "unknown subcommand: $sub" >&2; usage 1 ;;
+  esac
+}
+
+main "$@"

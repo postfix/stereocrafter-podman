@@ -1,4 +1,21 @@
-# stereocrafter — podman wrapper for TencentARC/StereoCrafter
+# 3dconvert — podman wrappers for 2D→stereo-3D video conversion
+
+Self-contained packaging of two complementary 2D→stereo-3D pipelines on Debian 13
+with 2× RTX 3090s, each as a podman image plus a thin host-side CLI:
+
+| Tool | Backend | Approach | Speed | Quality |
+|---|---|---|---|---|
+| **`./stereocrafter`** | [TencentARC/StereoCrafter](https://github.com/TencentARC/StereoCrafter) | Depth + forward-splatting + **SVD diffusion inpaint** | Slow (~4 s/frame 1080p on 2× 3090) | Strong, handles disocclusion via generative inpainting |
+| **`./depth-surge`** | [Tok/depth-surge-3d](https://github.com/Tok/depth-surge-3d) | Depth-Anything + DIBR + classical hole-fill (+ optional Real-ESRGAN, fisheye) | Fast (~1 s/frame 1080p on 1 × 3090) | Lower in disocclusion regions, better for VR (native fisheye) |
+
+Choose **stereocrafter** for highest quality on complex content with
+disocclusions (people, foreground objects).
+Choose **depth-surge** for fast batch processing, VR headsets (fisheye output),
+or long videos where wall-time matters more than perfect inpainting.
+
+---
+
+# stereocrafter — TencentARC/StereoCrafter wrapper
 
 Self-contained 2D → stereo-3D video pipeline using
 [TencentARC/StereoCrafter](https://github.com/TencentARC/StereoCrafter), packaged
@@ -142,12 +159,61 @@ weights dir because either `git lfs` didn't fetch real files (you got pointer
 stubs) or download was interrupted. Re-run `./stereocrafter pull-weights` (it
 skips dirs that look complete).
 
+---
+
+# depth-surge — Tok/depth-surge-3d wrapper
+
+Faster, simpler pipeline. Uses Depth-Anything-V2/V3 for depth and DIBR (depth-image-based
+rendering) with classical hole-fill — no diffusion inpainting. Single-pass, frame-by-frame,
+no chunking required.
+
+## Quick start
+
+```bash
+# one-time setup (~10-15 min image build + 1-2 GB model download)
+./depth-surge build
+./depth-surge pull-weights         # downloads Depth-Anything-V2-Large by default
+
+# convert
+./depth-surge convert /path/to/clip.mp4
+# outputs land in ./output/<clip_stem>_<timestamp>/{video}_SBS.mp4
+```
+
+## Env vars (override defaults)
+
+```
+DEPTHSURGE_VERSION       v2 | v3                       (default: v2)
+DEPTHSURGE_MODEL         depth-anything/Depth-Anything-V2-Large (default; switch to V2-Base for speed)
+DEPTHSURGE_FORMAT        side_by_side | over_under     (default: side_by_side)
+DEPTHSURGE_RESOLUTION    auto | 16x9-1080p | square-4k | custom:WxH ... (default: auto)
+DEPTHSURGE_BASELINE      stereo baseline in meters     (default: 0.065 = average IPD)
+DEPTHSURGE_HOLE_FILL     fast | advanced               (default: fast)
+DEPTHSURGE_UPSCALE       none | x2 | x4 | x4-conservative  (default: none)
+DEPTHSURGE_GPU           pin to a specific GPU index   (default: first visible)
+DEPTHSURGE_ANAGLYPH      set to 1 to also emit a red/cyan anaglyph mp4 via ffmpeg
+DEPTHSURGE_EXTRA         extra args appended to depth_surge_3d.py invocation
+```
+
+## When to pick depth-surge over stereocrafter
+
+- **Long videos** — DIBR is much faster; 1 hour of 1080p ≈ 1 h on one 3090 vs ~10 days on StereoCrafter
+- **VR headset playback** — native fisheye projection with selectable lens model
+- **Real-Time-ish testing** — quick visual preview of stereo conversion at low quality
+- **No disocclusion-heavy content** — landscapes, slow pans, static scenes
+
+## When to pick stereocrafter
+
+- **People + objects with parallax** — generative inpainting hides disocclusion artifacts much better
+- **Best possible quality** for short clips you'll re-watch
+
 ## Files in this repo
 
 | File | Purpose |
 |---|---|
-| `Dockerfile` | Image recipe (cu118 + py3.8 + StereoCrafter + Forward-Warp) |
-| `stereocrafter` | Host CLI wrapper (this is what you run) |
+| `Dockerfile` | StereoCrafter image recipe (cu118 + py3.8 + StereoCrafter + Forward-Warp) |
+| `Dockerfile.depth-surge` | Depth Surge image recipe (cu124 + py3.12 + Depth-Anything) |
+| `stereocrafter` | StereoCrafter host CLI wrapper |
+| `depth-surge` | Depth Surge host CLI wrapper |
 | `README.md` | This file |
-| `CHEATSHEET.md` | Per-task time + recommended-settings table |
+| `CHEATSHEET.md` | Per-task time + recommended-settings tables for both tools |
 | `.gitignore` | Excludes `weights/`, `input/`, `output/`, `out/` from version control |
