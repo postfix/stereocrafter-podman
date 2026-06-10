@@ -5,6 +5,7 @@ weights/
 input/
 output/
 out/
+testvideo/
 
 # Build artefacts
 *.log
